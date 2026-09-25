@@ -12,10 +12,10 @@
   POST   /sessions/{id}/copy-chunk      从已完成来源会话的成品服务端复制一段为目标会话分片
   POST   /sessions/{id}/complete        原子完成（区间全覆盖 + SHA-256 校验）
   DELETE /sessions/{id}                 放弃会话
-  GET    /sessions/{id}/download        会话下载（原有接口，不计数）
+  GET    /sessions/{id}/download        会话下载（原有接口，不计数；支持单 Range 断点续传：206/416）
   POST   /sessions/{id}/integrity-check 成品完整性巡检：流式核对长度与 SHA-256，异常即隔离
   POST   /sessions/{id}/tickets         签发受控下载票据（有效期 + 次数上限）
-  GET    /tickets/{ticket}/download     凭票下载（原子扣减一次，支持 Range）
+  GET    /tickets/{ticket}/download     凭票下载（有效范围原子扣减一次，支持 Range；非法范围/隔离不扣次）
   POST   /tickets/{ticket}/revoke       撤销票据
   GET    /storage/summary              运维只读：按四种状态汇总会话与字节数
 """
@@ -32,9 +32,9 @@ from pathlib import Path
 
 from anyio.to_thread import run_sync
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
 
-from . import claims, db, idempotency, integrity, schemas, settings, storage
+from . import claims, db, idempotency, integrity, ranges, schemas, settings, storage
 from .cleanup import start_janitor
 from .locks import session_locks
 
@@ -1548,7 +1548,10 @@ def complete_session(session_id: str) -> dict:
 
 
 @app.get("/api/v1/sessions/{session_id}/download", tags=["sessions"])
-def download_session(session_id: str) -> FileResponse:
+def download_session(
+    session_id: str,
+    request: Request,
+) -> Response:
     conn = db.get_conn()
     row = conn.execute(
         "SELECT filename FROM upload_sessions WHERE id = ? AND status = 'completed'",
@@ -1569,10 +1572,12 @@ def download_session(session_id: str) -> FileResponse:
     path = storage.artifact_path(session_id)
     if not path.is_file():
         raise _http(404, "no completed artifact for this session")
-    return FileResponse(
+    # 断点下载：无 Range 返回完整文件（200）；单个合法 Range 返回 206，
+    # 多范围/越界返回 416（不读文件内容）。本接口不计数。
+    return ranges.build_download_response(
         path,
-        media_type="application/octet-stream",
-        filename=storage.safe_filename(row["filename"]),
+        storage.safe_filename(row["filename"]),
+        request.headers.get("range"),
     )
 
 
@@ -1746,11 +1751,16 @@ def create_ticket(
     return payload
 
 
-def _claim_ticket_download(credential: str) -> tuple[sqlite3.Row, sqlite3.Row]:
-    """在单个 IMMEDIATE 事务中校验票据并原子扣减一次。
+def _claim_ticket_download(
+    credential: str, raw_range: str | None
+) -> tuple[sqlite3.Row, sqlite3.Row]:
+    """在单个 IMMEDIATE 事务中校验票据、规范化 Range 并原子扣减一次。
 
     返回 (票据行, 会话行)。任一校验失败都抛 HTTPException 且事务回滚，
     绝不扣减次数。条件 UPDATE 的 rowcount 是并发上限的最终防线。
+    Range 的语法/可满足性在扣减之前按成品实际长度判定：多范围、越界等
+    416 请求与隔离（423）一样只回滚、不扣次；判定只需 stat 长度，
+    不读取文件内容。
     """
     ticket_id, _, token = credential.partition(".")
     if not ticket_id or not token:
@@ -1794,6 +1804,10 @@ def _claim_ticket_download(credential: str) -> tuple[sqlite3.Row, sqlite3.Row]:
         if not path.is_file():
             raise _http(404, "no completed artifact for this session")
 
+        # Range 在扣减之前解析：多范围/越界（416）与其他拒绝一样回滚，
+        # 绝不扣减次数。这里只取长度做规范化，不打开文件读取内容。
+        ranges.parse_range_header(raw_range, path.stat().st_size)
+
         # 原子扣减：WHERE 重放全部前置条件，两个并发请求在此串行，
         # 后到者的 remaining_downloads 已是 0，rowcount=0 → 429，绝不超额。
         cur = tx.execute(
@@ -1811,16 +1825,17 @@ def _claim_ticket_download(credential: str) -> tuple[sqlite3.Row, sqlite3.Row]:
 
 
 @app.get("/api/v1/tickets/{ticket}/download", tags=["tickets"])
-def download_with_ticket(ticket: str) -> FileResponse:
-    _, session = _claim_ticket_download(ticket)
+def download_with_ticket(ticket: str, request: Request) -> Response:
+    raw_range = request.headers.get("range")
+    _, session = _claim_ticket_download(ticket, raw_range)
     session_id = session["id"]
-    # 校验与扣减已在事务中完成；Range 请求同样走到这里，按一次计数。
-    # FileResponse 原生处理 Range（206）与 If-Modified-Since，凭证不合法时
-    # 在到达此处之前就已抛错，因此失败请求不会扣减。
-    return FileResponse(
+    # 校验、Range 规范化与原子扣减已在同一事务中完成：合法 Range 按一次
+    # 计数（下载器断点续传消耗一次），范围非法（416）/隔离（423）等拒绝
+    # 在扣减前抛错，不计数。此处按已校验的 Range 流式输出对应字节。
+    return ranges.build_download_response(
         storage.artifact_path(session_id),
-        media_type="application/octet-stream",
-        filename=storage.safe_filename(session["filename"]),
+        storage.safe_filename(session["filename"]),
+        raw_range,
     )
 
 
